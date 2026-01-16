@@ -59,32 +59,32 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     """
     配置日志系统（同时输出到控制台和文件）
-    
+
     Args:
         debug: 是否启用调试模式
         log_dir: 日志文件目录
     """
     level = logging.DEBUG if debug else logging.INFO
-    
+
     # 创建日志目录
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
-    
+
     # 日志文件路径（按日期分文件）
     today_str = datetime.now().strftime('%Y%m%d')
     log_file = log_path / f"stock_analysis_{today_str}.log"
     debug_log_file = log_path / f"stock_analysis_debug_{today_str}.log"
-    
+
     # 创建根 logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)  # 根 logger 设为 DEBUG，由 handler 控制输出级别
-    
+
     # Handler 1: 控制台输出
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(console_handler)
-    
+
     # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
     file_handler = RotatingFileHandler(
         log_file,
@@ -95,7 +95,7 @@ def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(file_handler)
-    
+
     # Handler 3: 调试日志文件（DEBUG 级别，包含所有详细信息）
     debug_handler = RotatingFileHandler(
         debug_log_file,
@@ -106,13 +106,13 @@ def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(debug_handler)
-    
+
     # 降低第三方库的日志级别
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
     logging.getLogger('google').setLevel(logging.WARNING)
     logging.getLogger('httpx').setLevel(logging.WARNING)
-    
+
     logging.info(f"日志系统初始化完成，日志目录: {log_path.absolute()}")
     logging.info(f"常规日志: {log_file}")
     logging.info(f"调试日志: {debug_log_file}")
@@ -124,13 +124,13 @@ logger = logging.getLogger(__name__)
 class StockAnalysisPipeline:
     """
     股票分析主流程调度器
-    
+
     职责：
     1. 管理整个分析流程
     2. 协调数据获取、存储、搜索、分析、通知等模块
     3. 实现并发控制和异常处理
     """
-    
+
     def __init__(
         self,
         config: Optional[Config] = None,
@@ -138,103 +138,126 @@ class StockAnalysisPipeline:
     ):
         """
         初始化调度器
-        
+
         Args:
             config: 配置对象（可选，默认使用全局配置）
             max_workers: 最大并发线程数（可选，默认从配置读取）
         """
         self.config = config or get_config()
         self.max_workers = max_workers or self.config.max_workers
-        
+
         # 初始化各模块
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
         self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
-        self.analyzer = GeminiAnalyzer()
+        self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
+
+        # 初始化分析器列表 (支持双模型)
+        self.analyzers: List[GeminiAnalyzer] = []
+
+        # 1. 主模型 (Gemini 或默认配置)
+        main_analyzer = GeminiAnalyzer() # 使用默认配置
+        self.analyzers.append(main_analyzer)
+
+        # 2. 第二模型 (如果启用)
+        if self.config.enable_dual_model:
+            logger.info("已启用双模型分析 (Main + Second Model)")
+            if self.config.openai_api_key:
+                # 使用 OpenAI 配置作为第二模型 (通常用于 DeepSeek)
+                second_analyzer = GeminiAnalyzer(
+                    provider='openai',
+                    api_key=self.config.openai_api_key,
+                    base_url=self.config.openai_base_url,
+                    model_name=self.config.openai_model
+                )
+                # 标记该分析器以便后续识别 (monkey patch 一个 tag)
+                second_analyzer._is_secondary = True
+                self.analyzers.append(second_analyzer)
+                logger.info(f"第二模型初始化完成 (Model: {self.config.openai_model})")
+            else:
+                logger.warning("已启用双模型，但未配置 OPENAI_API_KEY，跳过初始化第二模型")
+
+        # 兼容旧代码调用 (self.analyzer 指向主模型)
+        self.analyzer = main_analyzer
         self.notifier = NotificationService()
-        
+
         # 初始化搜索服务
         self.search_service = SearchService(
             tavily_keys=self.config.tavily_api_keys,
             serpapi_keys=self.config.serpapi_keys,
         )
-        
+
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
         if self.search_service.is_available:
             logger.info("搜索服务已启用 (Tavily/SerpAPI)")
         else:
             logger.warning("搜索服务未启用（未配置 API Key）")
-    
+
     def fetch_and_save_stock_data(
-        self, 
+        self,
         code: str,
         force_refresh: bool = False
     ) -> Tuple[bool, Optional[str]]:
         """
         获取并保存单只股票数据
-        
+
         断点续传逻辑：
         1. 检查数据库是否已有今日数据
         2. 如果有且不强制刷新，则跳过网络请求
         3. 否则从数据源获取并保存
-        
+
         Args:
             code: 股票代码
             force_refresh: 是否强制刷新（忽略本地缓存）
-            
+
         Returns:
             Tuple[是否成功, 错误信息]
         """
         try:
             today = date.today()
-            
+
             # 断点续传检查：如果今日数据已存在，跳过
             if not force_refresh and self.db.has_today_data(code, today):
                 logger.info(f"[{code}] 今日数据已存在，跳过获取（断点续传）")
                 return True, None
-            
+
             # 从数据源获取数据
             logger.info(f"[{code}] 开始从数据源获取数据...")
             df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
-            
+
             if df is None or df.empty:
                 return False, "获取数据为空"
-            
+
             # 保存到数据库
             saved_count = self.db.save_daily_data(df, code, source_name)
             logger.info(f"[{code}] 数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
-            
+
             return True, None
-            
+
         except Exception as e:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
-    
-    def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
+
+    def analyze_stock(self, code: str, analyzer: Optional[GeminiAnalyzer] = None) -> Optional[AnalysisResult]:
         """
-        分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
-        
-        流程：
-        1. 获取实时行情（量比、换手率）
-        2. 获取筹码分布
-        3. 进行趋势分析（基于交易理念）
-        4. 多维度情报搜索（最新消息+风险排查+业绩预期）
-        5. 从数据库获取分析上下文
-        6. 调用 AI 进行综合分析
-        
+        分析单只股票（增强版）
+
         Args:
             code: 股票代码
-            
+            analyzer: 指定使用的分析器实例（可选，默认为 self.analyzer）
+
         Returns:
-            AnalysisResult 或 None（如果分析失败）
+            AnalysisResult 或 None
         """
+        # 使用指定的分析器或默认主分析器
+        target_analyzer = analyzer or self.analyzer
         try:
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = STOCK_NAME_MAP.get(code, '')
-            
+
             # Step 1: 获取实时行情（量比、换手率等）
             realtime_quote: Optional[RealtimeQuote] = None
             try:
@@ -247,11 +270,11 @@ class StockAnalysisPipeline:
                               f"量比={realtime_quote.volume_ratio}, 换手率={realtime_quote.turnover_rate}%")
             except Exception as e:
                 logger.warning(f"[{code}] 获取实时行情失败: {e}")
-            
+
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
                 stock_name = f'股票{code}'
-            
+
             # Step 2: 获取筹码分布
             chip_data: Optional[ChipDistribution] = None
             try:
@@ -261,7 +284,7 @@ class StockAnalysisPipeline:
                               f"90%集中度={chip_data.concentration_90:.2%}")
             except Exception as e:
                 logger.warning(f"[{code}] 获取筹码分布失败: {e}")
-            
+
             # Step 3: 趋势分析（基于交易理念）
             trend_result: Optional[TrendAnalysisResult] = None
             try:
@@ -277,19 +300,19 @@ class StockAnalysisPipeline:
                                   f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
             except Exception as e:
                 logger.warning(f"[{code}] 趋势分析失败: {e}")
-            
+
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
             if self.search_service.is_available:
                 logger.info(f"[{code}] 开始多维度情报搜索...")
-                
+
                 # 使用多维度搜索（最多3次搜索）
                 intel_results = self.search_service.search_comprehensive_intel(
                     stock_code=code,
                     stock_name=stock_name,
                     max_searches=3
                 )
-                
+
                 # 格式化情报报告
                 if intel_results:
                     news_context = self.search_service.format_intel_report(intel_results, stock_name)
@@ -300,33 +323,33 @@ class StockAnalysisPipeline:
                     logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
             else:
                 logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
-            
+
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
-            
+
             if context is None:
                 logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
                 return None
-            
+
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(
-                context, 
-                realtime_quote, 
-                chip_data, 
+                context,
+                realtime_quote,
+                chip_data,
                 trend_result,
                 stock_name  # 传入股票名称
             )
-            
+
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
-            result = self.analyzer.analyze(enhanced_context, news_context=news_context)
-            
+            result = target_analyzer.analyze(enhanced_context, news_context=news_context)
+
             return result
-            
+
         except Exception as e:
             logger.error(f"[{code}] 分析失败: {e}")
             logger.exception(f"[{code}] 详细错误信息:")
             return None
-    
+
     def _enhance_context(
         self,
         context: Dict[str, Any],
@@ -337,27 +360,27 @@ class StockAnalysisPipeline:
     ) -> Dict[str, Any]:
         """
         增强分析上下文
-        
+
         将实时行情、筹码分布、趋势分析结果、股票名称添加到上下文中
-        
+
         Args:
             context: 原始上下文
             realtime_quote: 实时行情数据
             chip_data: 筹码分布数据
             trend_result: 趋势分析结果
             stock_name: 股票名称
-            
+
         Returns:
             增强后的上下文
         """
         enhanced = context.copy()
-        
+
         # 添加股票名称
         if stock_name:
             enhanced['stock_name'] = stock_name
         elif realtime_quote and realtime_quote.name:
             enhanced['stock_name'] = realtime_quote.name
-        
+
         # 添加实时行情
         if realtime_quote:
             enhanced['realtime'] = {
@@ -372,7 +395,7 @@ class StockAnalysisPipeline:
                 'circ_mv': realtime_quote.circ_mv,
                 'change_60d': realtime_quote.change_60d,
             }
-        
+
         # 添加筹码分布
         if chip_data:
             current_price = realtime_quote.price if realtime_quote else 0
@@ -383,7 +406,7 @@ class StockAnalysisPipeline:
                 'concentration_70': chip_data.concentration_70,
                 'chip_status': chip_data.get_chip_status(current_price),
             }
-        
+
         # 添加趋势分析结果
         if trend_result:
             enhanced['trend_analysis'] = {
@@ -399,13 +422,13 @@ class StockAnalysisPipeline:
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
             }
-        
+
         return enhanced
-    
+
     def _describe_volume_ratio(self, volume_ratio: float) -> str:
         """
         量比描述
-        
+
         量比 = 当前成交量 / 过去5日平均成交量
         """
         if volume_ratio < 0.5:
@@ -420,124 +443,134 @@ class StockAnalysisPipeline:
             return "明显放量"
         else:
             return "巨量"
-    
+
     def process_single_stock(
-        self, 
+        self,
         code: str,
         skip_analysis: bool = False
-    ) -> Optional[AnalysisResult]:
+    ) -> List[AnalysisResult]:
         """
         处理单只股票的完整流程
-        
-        包括：
-        1. 获取数据
-        2. 保存数据
-        3. AI 分析
-        
-        此方法会被线程池调用，需要处理好异常
-        
-        Args:
-            code: 股票代码
-            skip_analysis: 是否跳过 AI 分析
-            
-        Returns:
-            AnalysisResult 或 None
+
+        支持多模型分析，返回结果列表
         """
         logger.info(f"========== 开始处理 {code} ==========")
-        
+        results = []
+
         try:
             # Step 1: 获取并保存数据
             success, error = self.fetch_and_save_stock_data(code)
-            
+
             if not success:
                 logger.warning(f"[{code}] 数据获取失败: {error}")
-                # 即使获取失败，也尝试用已有数据分析
-            
+
             # Step 2: AI 分析
             if skip_analysis:
                 logger.info(f"[{code}] 跳过 AI 分析（dry-run 模式）")
-                return None
-            
-            result = self.analyze_stock(code)
-            
-            if result:
-                logger.info(
-                    f"[{code}] 分析完成: {result.operation_advice}, "
-                    f"评分 {result.sentiment_score}"
-                )
-            
-            return result
-            
+                return []
+
+            # 遍历所有可用分析器
+            for i, analyzer in enumerate(self.analyzers):
+                try:
+                    # 区分主模型和副模型
+                    is_secondary = getattr(analyzer, '_is_secondary', False)
+                    result = self.analyze_stock(code, analyzer=analyzer)
+
+                    if result:
+                        # 如果是第二模型，修改显示的名称方便区分
+                        if is_secondary:
+                            model_suffix = self.config.openai_model or "DeepSeek"
+                            # 简化名称，避免太长
+                            if "deepseek" in model_suffix.lower():
+                                suffix = "DeepSeek"
+                            elif "gpt" in model_suffix.lower():
+                                suffix = "GPT"
+                            else:
+                                suffix = "Model2"
+
+                            result.name = f"{result.name} ({suffix})"
+                            logger.info(f"[{code}] 第二模型分析完成: {result.name}")
+
+                        logger.info(
+                            f"[{code}] 分析完成 ({'Main' if not is_secondary else 'Second'}): "
+                            f"{result.operation_advice}, 评分 {result.sentiment_score}"
+                        )
+                        results.append(result)
+
+                except Exception as e:
+                    logger.error(f"[{code}] 分析器 {i+1} 执行失败: {e}")
+
+            return results
+
         except Exception as e:
-            # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
-            return None
-    
+            return []
+
     def run(
-        self, 
+        self,
         stock_codes: Optional[List[str]] = None,
         dry_run: bool = False,
         send_notification: bool = True
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
-        
+
         流程：
         1. 获取待分析的股票列表
         2. 使用线程池并发处理
         3. 收集分析结果
         4. 发送通知
-        
+
         Args:
             stock_codes: 股票代码列表（可选，默认使用配置中的自选股）
             dry_run: 是否仅获取数据不分析
             send_notification: 是否发送推送通知
-            
+
         Returns:
             分析结果列表
         """
         start_time = time.time()
-        
+
         # 使用配置中的股票列表
         if stock_codes is None:
             stock_codes = self.config.stock_list
-        
+
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
             return []
-        
+
         logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")
         logger.info(f"股票列表: {', '.join(stock_codes)}")
         logger.info(f"并发数: {self.max_workers}, 模式: {'仅获取数据' if dry_run else '完整分析'}")
-        
+
         results: List[AnalysisResult] = []
-        
+
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交任务
             future_to_code = {
                 executor.submit(
-                    self.process_single_stock, 
-                    code, 
+                    self.process_single_stock,
+                    code,
                     skip_analysis=dry_run
                 ): code
                 for code in stock_codes
             }
-            
+
             # 收集结果
             for future in as_completed(future_to_code):
                 code = future_to_code[future]
                 try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
+                    stock_results = future.result()
+                    if stock_results:
+                        results.extend(stock_results)
                 except Exception as e:
                     logger.error(f"[{code}] 任务执行失败: {e}")
-        
+
         # 统计
         elapsed_time = time.time() - start_time
-        
+
         # dry-run 模式下，数据获取成功即视为成功
         if dry_run:
             # 检查哪些股票的数据今天已存在
@@ -546,35 +579,35 @@ class StockAnalysisPipeline:
         else:
             success_count = len(results)
             fail_count = len(stock_codes) - success_count
-        
+
         logger.info(f"===== 分析完成 =====")
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
-        
+
         # 发送通知
         if results and send_notification and not dry_run:
             self._send_notifications(results)
-        
+
         return results
-    
+
     def _send_notifications(self, results: List[AnalysisResult]) -> None:
         """
         发送分析结果通知
-        
+
         生成决策仪表盘格式的报告
-        
+
         Args:
             results: 分析结果列表
         """
         try:
             logger.info("生成决策仪表盘日报...")
-            
+
             # 生成决策仪表盘格式的详细日报
             report = self.notifier.generate_dashboard_report(results)
-            
+
             # 保存到本地
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
-            
+
             # 推送通知
             if self.notifier.is_available():
                 channels = self.notifier.get_available_channels()
@@ -610,7 +643,7 @@ class StockAnalysisPipeline:
                     logger.warning("决策仪表盘推送失败")
             else:
                 logger.info("通知渠道未配置，跳过推送")
-                
+
         except Exception as e:
             logger.error(f"发送通知失败: {e}")
 
@@ -631,108 +664,108 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --market-review    # 仅运行大盘复盘
         '''
     )
-    
+
     parser.add_argument(
         '--debug',
         action='store_true',
         help='启用调试模式，输出详细日志'
     )
-    
+
     parser.add_argument(
         '--dry-run',
         action='store_true',
         help='仅获取数据，不进行 AI 分析'
     )
-    
+
     parser.add_argument(
         '--stocks',
         type=str,
         help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
     )
-    
+
     parser.add_argument(
         '--no-notify',
         action='store_true',
         help='不发送推送通知'
     )
-    
+
     parser.add_argument(
         '--workers',
         type=int,
         default=None,
         help='并发线程数（默认使用配置值）'
     )
-    
+
     parser.add_argument(
         '--schedule',
         action='store_true',
         help='启用定时任务模式，每日定时执行'
     )
-    
+
     parser.add_argument(
         '--market-review',
         action='store_true',
         help='仅运行大盘复盘分析'
     )
-    
+
     parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
     )
-    
+
     return parser.parse_args()
 
 
 def run_market_review(notifier: NotificationService, analyzer=None, search_service=None) -> Optional[str]:
     """
     执行大盘复盘分析
-    
+
     Args:
         notifier: 通知服务
         analyzer: AI分析器（可选）
         search_service: 搜索服务（可选）
-    
+
     Returns:
         复盘报告文本
     """
     logger.info("开始执行大盘复盘分析...")
-    
+
     try:
         market_analyzer = MarketAnalyzer(
             search_service=search_service,
             analyzer=analyzer
         )
-        
+
         # 执行复盘
         review_report = market_analyzer.run_daily_review()
-        
+
         if review_report:
             # 保存报告到文件
             date_str = datetime.now().strftime('%Y%m%d')
             report_filename = f"market_review_{date_str}.md"
             filepath = notifier.save_report_to_file(
-                f"# 🎯 大盘复盘\n\n{review_report}", 
+                f"# 🎯 大盘复盘\n\n{review_report}",
                 report_filename
             )
             logger.info(f"大盘复盘报告已保存: {filepath}")
-            
+
             # 推送通知
             if notifier.is_available():
                 # 添加标题
                 report_content = f"🎯 大盘复盘\n\n{review_report}"
-                
+
                 success = notifier.send(report_content)
                 if success:
                     logger.info("大盘复盘推送成功")
                 else:
                     logger.warning("大盘复盘推送失败")
-            
+
             return review_report
-        
+
     except Exception as e:
         logger.error(f"大盘复盘分析失败: {e}")
-    
+
     return None
 
 
@@ -743,7 +776,7 @@ def run_full_analysis(
 ):
     """
     执行完整的分析流程（个股 + 大盘复盘）
-    
+
     这是定时任务调用的主函数
     """
     try:
@@ -752,14 +785,14 @@ def run_full_analysis(
             config=config,
             max_workers=args.workers
         )
-        
+
         # 1. 运行个股分析
         results = pipeline.run(
             stock_codes=stock_codes,
             dry_run=args.dry_run,
             send_notification=not args.no_notify
         )
-        
+
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
         market_report = ""
         if config.market_review_enabled and not args.no_market_review:
@@ -772,7 +805,7 @@ def run_full_analysis(
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
                 market_report = review_result
-        
+
         # 输出摘要
         if results:
             logger.info("\n===== 分析结果摘要 =====")
@@ -782,7 +815,7 @@ def run_full_analysis(
                     f"{emoji} {r.name}({r.code}): {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"
                 )
-        
+
         logger.info("\n任务执行完成")
 
         # === 新增：生成飞书云文档 ===
@@ -817,7 +850,7 @@ def run_full_analysis(
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
-        
+
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
 
@@ -825,84 +858,84 @@ def run_full_analysis(
 def main() -> int:
     """
     主入口函数
-    
+
     Returns:
         退出码（0 表示成功）
     """
     # 解析命令行参数
     args = parse_arguments()
-    
+
     # 加载配置（在设置日志前加载，以获取日志目录）
     config = get_config()
-    
+
     # 配置日志（输出到控制台和文件）
     setup_logging(debug=args.debug, log_dir=config.log_dir)
-    
+
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
+
     # 验证配置
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
-    
+
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-    
+
     try:
         # 模式1: 仅大盘复盘
         if args.market_review:
             logger.info("模式: 仅大盘复盘")
             notifier = NotificationService()
-            
+
             # 初始化搜索服务和分析器（如果有配置）
             search_service = None
             analyzer = None
-            
+
             if config.tavily_api_keys or config.serpapi_keys:
                 search_service = SearchService(
                     tavily_keys=config.tavily_api_keys,
                     serpapi_keys=config.serpapi_keys
                 )
-            
+
             if config.gemini_api_key:
                 analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-            
+
             run_market_review(notifier, analyzer, search_service)
             return 0
-        
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
-            
+
             from scheduler import run_with_schedule
-            
+
             def scheduled_task():
                 run_full_analysis(config, args, stock_codes)
-            
+
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
                 run_immediately=True  # 启动时先执行一次
             )
             return 0
-        
+
         # 模式3: 正常单次运行
         run_full_analysis(config, args, stock_codes)
-        
+
         logger.info("\n程序执行完成")
         return 0
-        
+
     except KeyboardInterrupt:
         logger.info("\n用户中断，程序退出")
         return 130
-        
+
     except Exception as e:
         logger.exception(f"程序执行失败: {e}")
         return 1
