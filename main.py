@@ -188,12 +188,46 @@ class StockAnalysisPipeline:
             serpapi_keys=self.config.serpapi_keys,
         )
 
-        logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
-        logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
-        if self.search_service.is_available:
-            logger.info("搜索服务已启用 (Tavily/SerpAPI)")
+        self._print_config_summary()
+
+    def _print_config_summary(self):
+        """打印详细的配置状态日志"""
+        logger.info("="*40)
+        logger.info("🚀 A股智能分析系统 - 启动配置检查")
+        logger.info("="*40)
+
+        # 1. AI 配置
+        logger.info(f"🤖 主模型 (Gemini): {'✅ 已配置' if self.config.gemini_api_key else '❌ 未配置'}")
+
+        dual_enabled = self.config.enable_dual_model
+        openai_key = bool(self.config.openai_api_key)
+
+        if dual_enabled:
+            status = "✅ 已启用" if openai_key else "❌ 启用但缺少 Key"
+            logger.info(f"👥 双模型 (DeepSeek): {status}")
+            if not openai_key:
+                logger.error("   ❌ 严重: ENABLE_DUAL_MODEL=true 但缺少 OPENAI_API_KEY")
+                logger.error("   -> 请在 GitHub Secrets 添加 OPENAI_API_KEY (即 DeepSeek API Key)")
         else:
-            logger.warning("搜索服务未启用（未配置 API Key）")
+            logger.info("👥 双模型 (DeepSeek): ⚪ 未启用 (ENABLE_DUAL_MODEL=false)")
+
+        # 2. 搜索配置
+        has_search = self.search_service.is_available
+        search_status = "✅ 已启用" if has_search else "⚠️ 未启用"
+        logger.info(f"🌍 新闻搜索: {search_status}")
+        if not has_search:
+            logger.warning("   -> 建议配置 TAVILY_API_KEYS 以获取实时新闻/舆情分析")
+
+        # 3. 股票列表
+        stocks = self.config.stock_list
+        logger.info(f"📈 待分析股票: {len(stocks)} 只")
+        if not stocks:
+            logger.error("   ❌ 错误: STOCK_LIST 为空或解析失败")
+        else:
+            preview = ", ".join(stocks[:3]) + ("..." if len(stocks)>3 else "")
+            logger.info(f"   -> 列表: {preview}")
+
+        logger.info("="*40)
 
     def fetch_and_save_stock_data(
         self,
