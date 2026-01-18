@@ -490,9 +490,18 @@ class GeminiAnalyzer:
         target_model = model_name or config.gemini_model
 
         try:
+            # 宽容的安全设置，防止财经术语被误判
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+
             self._model = genai.GenerativeModel(
                 model_name=target_model,
                 system_instruction=self.SYSTEM_PROMPT,
+                safety_settings=safety_settings,
             )
             self._current_model_name = target_model
             logger.info(f"Gemini 模型初始化成功 (model: {target_model})")
@@ -501,9 +510,18 @@ class GeminiAnalyzer:
             if not self._explicit_config:
                 fallback = config.gemini_model_fallback
                 logger.warning(f"主模型 {target_model} 失败，尝试备选: {fallback}")
+
+                safety_settings = [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                ]
+
                 self._model = genai.GenerativeModel(
                     model_name=fallback,
                     system_instruction=self.SYSTEM_PROMPT,
+                    safety_settings=safety_settings,
                 )
                 self._current_model_name = fallback
                 self._using_fallback = True
@@ -623,9 +641,18 @@ class GeminiAnalyzer:
             fallback_model = config.gemini_model_fallback
 
             logger.warning(f"[LLM] 切换到备选模型: {fallback_model}")
+
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+
             self._model = genai.GenerativeModel(
                 model_name=fallback_model,
                 system_instruction=self.SYSTEM_PROMPT,
+                safety_settings=safety_settings,
             )
             self._current_model_name = fallback_model
             self._using_fallback = True
