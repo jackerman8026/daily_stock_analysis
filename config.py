@@ -148,6 +148,8 @@ class Config:
 
         # 解析自选股列表（逗号分隔）
         stock_list_str = os.getenv('STOCK_LIST', '')
+        # 支持中文逗号、换行符、空格作为分隔符
+        stock_list_str = stock_list_str.replace('，', ',').replace('\n', ',').replace(' ', ',')
         stock_list = [
             code.strip()
             for code in stock_list_str.split(',')

@@ -505,16 +505,19 @@ class StockAnalysisPipeline:
 
             # 遍历所有可用分析器
             for i, analyzer in enumerate(self.analyzers):
+                # 区分主模型和副模型
+                is_secondary = getattr(analyzer, '_is_secondary', False)
+                provider = getattr(analyzer, '_provider', 'gemini')
+                model_tag = f"Model {i+1} ({provider})"
+
                 try:
-                    # 区分主模型和副模型
-                    is_secondary = getattr(analyzer, '_is_secondary', False)
+                    logger.info(f"🤖 正在调用 AI 进行分析 [{model_tag}]...")
                     result = self.analyze_stock(code, analyzer=analyzer)
 
                     if result:
                         # 如果是第二模型，修改显示的名称方便区分
                         if is_secondary:
                             model_suffix = self.config.openai_model or "DeepSeek"
-                            # 简化名称，避免太长
                             if "deepseek" in model_suffix.lower():
                                 suffix = "DeepSeek"
                             elif "gpt" in model_suffix.lower():
@@ -526,13 +529,20 @@ class StockAnalysisPipeline:
                             logger.info(f"[{code}] 第二模型分析完成: {result.name}")
 
                         logger.info(
-                            f"[{code}] 分析完成 ({'Main' if not is_secondary else 'Second'}): "
+                            f"[{code}] 分析完成 ({model_tag}): "
                             f"{result.operation_advice}, 评分 {result.sentiment_score}"
                         )
                         results.append(result)
+                    else:
+                        logger.warning(f"❌ 分析返回空结果 [{model_tag}] - {code}")
 
                 except Exception as e:
-                    logger.error(f"[{code}] 分析器 {i+1} 执行失败: {e}")
+                    logger.error(f"❌ 分析器执行失败 [{model_tag}] - {code}: {e}")
+                    # 不阻断其他模型的分析
+                    continue
+
+            if not results:
+                logger.warning(f"⚠️ 所有模型分析均失败: {code}")
 
             return results
 
